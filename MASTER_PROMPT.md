@@ -28,6 +28,22 @@ This document records the original requirements for `process_pdfs.py`.
 | 5 | Cross-file PDF links (GoToR) rewritten as internal GoTo links | ✅ Done |
 | 6 | Incremental GitHub commits with updated docs at each step | ✅ Done |
 
+## Verification
+
+```bash
+# Combine two PDFs
+python process_pdfs.py 86etm.pdf,86etm2.pdf -o combined.pdf
+
+# Combine all with TOC
+python process_pdfs.py "86etm*.pdf" --gen_toc -o combined_toc.pdf
+
+# OCR (requires Tesseract on PATH)
+python process_pdfs.py 86etm.pdf --ocr -o combined_ocr.pdf
+
+# All options
+python process_pdfs.py "86etm*.pdf" --ocr --gen_toc -o complete.pdf
+```
+
 ## Implementation Notes
 
 - Primary PDF library: **PyMuPDF** (`fitz`) — handles merging, bookmarks, links, annotations

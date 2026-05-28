@@ -57,11 +57,29 @@ Each git commit represents a working, testable milestone:
 
 ```bash
 # Quick smoke test — combine two PDFs
-python process_pdfs.py a.pdf,b.pdf -o test_out.pdf
-
-# With OCR (needs Tesseract installed)
-python process_pdfs.py scan.pdf --ocr -o ocr_out.pdf
+python process_pdfs.py 86etm.pdf,86etm2.pdf -o test_out.pdf
 
 # With TOC
-python process_pdfs.py "*.pdf" --gen_toc -o toc_out.pdf
+python process_pdfs.py "86etm*.pdf" --gen_toc -o toc_out.pdf
+
+# With OCR (needs Tesseract installed)
+python process_pdfs.py 86etm.pdf --ocr -o ocr_out.pdf
+
+# All options
+python process_pdfs.py "86etm*.pdf" --ocr --gen_toc -o complete.pdf
 ```
+
+## Sample Files
+
+The repository root contains sample PDFs (`86etm*.pdf`, `86howto.pdf`) that were present
+when the project was initialized — use these for smoke-testing.
+
+## Edge Cases Handled
+
+| Situation | Behaviour |
+|-----------|-----------|
+| Pattern matches no files | Warning printed; script aborts if *all* patterns fail |
+| Tesseract not on PATH | Warning + original file copied; combination continues |
+| Input PDF already has OCR text | `skip_text=True` skips re-OCR for that page |
+| GoToR link target not in input list | Link left as-is (GoToR) |
+| Overflowing TOC | New page added automatically |

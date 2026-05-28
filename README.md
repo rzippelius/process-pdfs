@@ -66,6 +66,12 @@ python process_pdfs.py "part*.pdf" --gen_toc --out book_with_toc.pdf
 python process_pdfs.py "vol*.pdf" --ocr --gen_toc -o complete.pdf
 ```
 
+## Notes
+
+- **No Tesseract?** The `--ocr` flag will warn and fall back to copying the original file unchanged. All other features still work — install Tesseract separately to enable real OCR.
+- **Wildcard tip**: Quote patterns containing `*` on the command line to prevent shell expansion: `"*.pdf"`.
+- **Output excluded from wildcard**: `combined.pdf` is listed in `.gitignore` but is not auto-excluded from your own patterns. Use a distinct output name or run the combination in a separate directory.
+
 ## How It Works
 
 ```

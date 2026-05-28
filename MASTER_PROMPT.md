@@ -48,6 +48,8 @@ python process_pdfs.py "86etm*.pdf" --ocr --gen_toc -o complete.pdf
 
 - Primary PDF library: **PyMuPDF** (`fitz`) — handles merging, bookmarks, links, annotations
 - OCR pipeline: **ocrmypdf** — wraps Tesseract; `--skip-text` prevents re-OCR of existing text
-- Cross-file link resolution: GoToR links matched by absolute path, relative path, and basename
+- Cross-file link resolution uses two passes:
+  1. **PyMuPDF pass** (in-memory, before save): fixes `/GoToR` links via `get_links()`
+  2. **pikepdf pass** (on saved file): fixes `/Launch` annotations that PyMuPDF's API doesn't expose — common in PDFs that use Launch to open companion documents
 - TOC page is appended at the **end** of the combined PDF (per spec) and also written to the
   PDF outline/bookmark tree for sidebar navigation

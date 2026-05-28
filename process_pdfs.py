@@ -18,6 +18,67 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
+# Windows: auto-add OCR tools to PATH if installed but not on PATH
+# ---------------------------------------------------------------------------
+
+def _add_to_path_if_found(exe_name: str, candidates: list[str], label: str) -> bool:
+    """Try candidate directories for exe_name; add the first match to PATH.
+
+    Returns True if the executable was already on PATH or was found and added.
+    """
+    if shutil.which(exe_name):
+        return True
+    if sys.platform != "win32":
+        return False
+    for directory in candidates:
+        if os.path.isfile(os.path.join(directory, exe_name)):
+            os.environ["PATH"] = os.environ["PATH"] + os.pathsep + directory
+            print(f"Info: added {label} to PATH from {directory}", file=sys.stderr)
+            return True
+    return False
+
+
+def _ensure_tesseract_on_path() -> None:
+    """On Windows, add Tesseract to PATH if installed but not found on PATH."""
+    _add_to_path_if_found(
+        "tesseract.exe",
+        [
+            r"C:\Program Files\Tesseract-OCR",
+            r"C:\Program Files (x86)\Tesseract-OCR",
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Tesseract-OCR"),
+        ],
+        "Tesseract",
+    )
+
+
+def _ensure_ghostscript_on_path() -> None:
+    """On Windows, add Ghostscript to PATH if installed but not found on PATH.
+
+    Ghostscript is used by ocrmypdf for PDF optimisation; without it ocrmypdf
+    still works but emits many [WinError 2] probe warnings.
+    """
+    if shutil.which("gswin64c") or shutil.which("gs"):
+        return
+    if sys.platform != "win32":
+        return
+
+    # Ghostscript installs under C:\Program Files\gs\gs<version>\bin\
+    gs_glob = glob.glob(r"C:\Program Files\gs\gs*\bin")
+    gs_glob += glob.glob(r"C:\Program Files (x86)\gs\gs*\bin")
+    if gs_glob:
+        gs_dir = sorted(gs_glob)[-1]  # newest version
+        found = _add_to_path_if_found("gswin64c.exe", [gs_dir], "Ghostscript")
+        if not found:
+            _add_to_path_if_found("gswin32c.exe", [gs_dir], "Ghostscript (32-bit)")
+    else:
+        print(
+            "Info: Ghostscript not found — OCR will still work but PDF optimisation "
+            "is limited. Install from https://ghostscript.com/releases/gsdnld.html",
+            file=sys.stderr,
+        )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -90,6 +151,9 @@ def ocr_file(src_path: str, dst_path: str) -> None:
     Pages that already contain text are skipped (--skip-text) to avoid
     degrading quality of already-searchable PDFs.
     """
+    _ensure_tesseract_on_path()
+    _ensure_ghostscript_on_path()
+
     try:
         import ocrmypdf
     except ImportError:
@@ -160,10 +224,24 @@ def combine_pdfs(
     combined.save(output_path, garbage=4, deflate=True)
     combined.close()
 
+    # Second pass: fix /Launch annotations that PyMuPDF's get_links() does not expose.
+    # These are common when PDFs use /Launch to open companion PDF files.
+    _fix_launch_links(output_path, file_meta)
+
 
 # ---------------------------------------------------------------------------
-# Cross-file link fixing
+# Cross-file link fixing — shared helpers
 # ---------------------------------------------------------------------------
+
+def _build_offset_lookup(file_meta: list) -> dict[str, int]:
+    """Build a dict mapping every plausible path form → page offset in combined doc."""
+    offset_by: dict[str, int] = {}
+    for orig_path, page_offset, _, _ in file_meta:
+        abs_path = os.path.abspath(orig_path)
+        for key in (abs_path, orig_path, os.path.basename(orig_path), Path(orig_path).stem):
+            offset_by[key] = page_offset
+    return offset_by
+
 
 def _resolve_offset(
     target_file: str,
@@ -183,20 +261,14 @@ def _resolve_offset(
 
 
 def _fix_cross_file_links(doc, file_meta: list) -> None:
-    """Convert GoToR (external-file) links into internal GoTo links.
+    """Convert GoToR (external-file) links into internal GoTo links via PyMuPDF.
 
-    After combining, links that originally pointed to other input PDFs are
-    rewritten to point to the corresponding page in the combined document.
+    PyMuPDF's get_links() exposes GoToR links but not /Launch annotations;
+    the latter are handled by _fix_launch_links() after saving.
     """
     import fitz
 
-    # Build lookup from every plausible path representation → page offset
-    offset_by_path: dict[str, int] = {}
-    for orig_path, page_offset, _, _ in file_meta:
-        abs_path = os.path.abspath(orig_path)
-        for key in (abs_path, orig_path, os.path.basename(orig_path), Path(orig_path).stem):
-            offset_by_path[key] = page_offset
-
+    offset_by_path = _build_offset_lookup(file_meta)
     total_pages = len(doc)
 
     for page_num in range(total_pages):
@@ -221,6 +293,72 @@ def _fix_cross_file_links(doc, file_meta: list) -> None:
                 "page": target_page,
                 "to": fitz.Point(0, 0),
             })
+
+
+def _fix_launch_links(output_path: str, file_meta: list) -> None:
+    """Post-process the saved PDF with pikepdf to convert /Launch → /GoTo.
+
+    PDF viewers open /Launch annotations by launching an external application;
+    when the target is another input PDF, the correct behaviour after combining
+    is to navigate to the first page of that file within the combined document.
+
+    PyMuPDF's get_links() does not surface /Launch annotations, so this step
+    uses pikepdf for direct PDF-object access.
+    """
+    import pikepdf
+
+    offset_by = _build_offset_lookup(file_meta)
+    changed = False
+
+    with pikepdf.open(output_path, allow_overwriting_input=True) as pdf:
+        total_pages = len(pdf.pages)
+
+        for page in pdf.pages:
+            raw_annots = page.get("/Annots", pikepdf.Array())
+            if not raw_annots:
+                continue
+
+            for annot in raw_annots:
+                try:
+                    if str(annot.get("/Subtype", "")) != "/Link":
+                        continue
+                    action = annot.get("/A")
+                    if action is None:
+                        continue
+                    if str(action.get("/S", "")) != "/Launch":
+                        continue
+
+                    # /F is either a string or a FileSpec dictionary
+                    f_obj = action.get("/F")
+                    if f_obj is None:
+                        continue
+                    target = (
+                        str(f_obj.get("/F", f_obj))
+                        if hasattr(f_obj, "get")
+                        else str(f_obj)
+                    )
+                    if not target:
+                        continue
+
+                    offset = _resolve_offset(target, offset_by)
+                    if offset is None:
+                        continue  # target is not one of our input files
+
+                    abs_page_idx = max(0, min(offset, total_pages - 1))
+                    annot["/A"] = pikepdf.Dictionary(
+                        S=pikepdf.Name("/GoTo"),
+                        D=pikepdf.Array([
+                            pdf.pages[abs_page_idx].obj,
+                            pikepdf.Name("/Fit"),
+                        ]),
+                    )
+                    changed = True
+
+                except Exception:
+                    continue
+
+        if changed:
+            pdf.save()  # overwrite in place (allow_overwriting_input=True)
 
 
 # ---------------------------------------------------------------------------

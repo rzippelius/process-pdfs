@@ -23,16 +23,27 @@ main()
  ├── ocr_file(src, dst)           ocrmypdf.ocr(..., skip_text=True)
  └── combine_pdfs(pdfs, out, ...)
       ├── fitz.open() + insert_pdf() per file   build combined doc, collect file_meta
-      ├── _fix_cross_file_links()               GoToR → GoTo with page offset
+      ├── _fix_cross_file_links()               GoToR → GoTo via PyMuPDF get_links()
       ├── _add_toc_page()                       append visible TOC page with link annotations
-      └── _set_bookmarks()                      doc.set_toc() with merged outline
+      ├── _set_bookmarks()                      doc.set_toc() with merged outline
+      ├── fitz.save()                           write combined PDF to disk
+      └── _fix_launch_links()                   /Launch → /GoTo via pikepdf (second pass)
 ```
+
+### Why Two Link-Fixing Passes
+
+PyMuPDF's `get_links()` exposes `/GoToR` links but **silently drops `/Launch` annotations**.
+Many PDFs use `/Launch` to open companion PDFs (e.g. a component manual referenced from a
+main document). After combining, these should navigate inside the combined PDF.
+The pikepdf second pass reads the raw annotation objects from the saved file and rewrites
+any `/Launch` whose `/F` target matches one of the input files.
 
 ## Libraries
 
 | Library | Role |
 |---------|------|
-| `PyMuPDF` (`fitz`) | All PDF I/O, merging, links, annotations, bookmarks |
+| `PyMuPDF` (`fitz`) | PDF I/O, merging, GoToR links, annotations, bookmarks |
+| `pikepdf` | Low-level PDF object access — used to fix /Launch annotations |
 | `ocrmypdf` | OCR pipeline wrapper around Tesseract |
 | `pypdf` | Installed as fallback, not actively used |
 

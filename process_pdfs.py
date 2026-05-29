@@ -189,6 +189,7 @@ def combine_pdfs(
     output_path: str,
     original_paths: list[str] | None = None,
     gen_toc: bool = False,
+    extract_headings: bool = False,
 ) -> None:
     """Merge pdf_paths into output_path.
 
@@ -198,6 +199,9 @@ def combine_pdfs(
         original_paths: Parallel list of original filenames used for link resolution.
             Defaults to pdf_paths when not provided.
         gen_toc: When True, append a visible clickable TOC page at the end.
+        extract_headings: When True, fall back to font-size analysis to derive
+            headings from the text layer when a PDF has no existing bookmarks.
+            Intended for OCR'd files.
     """
     import fitz
     import pikepdf
@@ -218,6 +222,8 @@ def combine_pdfs(
                 page_count = len(src.pages)
                 merged.pages.extend(src.pages)
             toc = _get_toc(pdf_path)
+            if extract_headings and not toc:
+                toc = _extract_headings_from_text(pdf_path)
             file_meta.append((orig_path, page_offset, page_count, toc))
 
         # pikepdf.pages.extend() copies Widget annotation /Parent form-field
@@ -255,6 +261,107 @@ def _get_toc(pdf_path: str) -> list:
         return toc
     except Exception:
         return []
+
+
+def _extract_headings_from_text(pdf_path: str) -> list:
+    """Derive headings from the PDF text layer by analysing font-size distribution.
+
+    Returns a list of [level, title, page_num] entries (1-based page numbers)
+    compatible with fitz TOC format.  Falls back to [] on any error or when the
+    document has no meaningful size variation (e.g. uniform body text only).
+
+    Algorithm:
+    - Collect every text span's font size, excluding the top/bottom 7 % of each
+      page (running headers/footers).
+    - Treat the most-frequent rounded size as the body baseline.
+    - Spans >= 1.4× baseline  →  level 1 heading
+    - Spans >= 1.15× baseline →  level 2 heading
+    - Bold spans at body size  →  level 3 heading
+    """
+    import fitz
+    from collections import Counter
+
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return []
+
+    spans_data: list[tuple[int, float, bool, str]] = []  # (pg_idx, size, bold, text)
+
+    for pg_idx, page in enumerate(doc):
+        page_h = page.rect.height
+        margin_top = page_h * 0.07
+        margin_bot = page_h * 0.93
+        for block in page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE).get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                y_top = line["bbox"][1]
+                if y_top < margin_top or y_top > margin_bot:
+                    continue
+                parts, max_size, is_bold = [], 0.0, False
+                for span in line.get("spans", []):
+                    t = span.get("text", "").strip()
+                    if t:
+                        parts.append(t)
+                        sz = float(span.get("size", 0))
+                        if sz > max_size:
+                            max_size = sz
+                        if span.get("flags", 0) & 16:  # bold flag
+                            is_bold = True
+                text = " ".join(parts).strip()
+                if text and max_size > 0:
+                    spans_data.append((pg_idx, max_size, is_bold, text))
+
+    doc.close()
+
+    if not spans_data:
+        return []
+
+    # Body size = mode of all collected sizes (rounded to 1 decimal place)
+    size_counts = Counter(round(s[1], 1) for s in spans_data)
+    body_size = size_counts.most_common(1)[0][0]
+    if body_size <= 0:
+        return []
+
+    total_pages = max(1, (max(s[0] for s in spans_data) + 1))
+
+    raw: list = []
+    for pg_idx, size, bold, text in spans_data:
+        if len(text) < 3 or len(text) > 120:
+            continue
+        if text.replace(".", "").replace(" ", "").isdigit():
+            continue  # skip pure page numbers / numbering
+
+        ratio = size / body_size
+        if ratio >= 1.4:
+            level = 1
+        elif ratio >= 1.15:
+            level = 2
+        elif bold and ratio >= 0.95:
+            level = 3
+        else:
+            continue
+
+        raw.append([level, text, pg_idx + 1])
+
+    # Filter out repeating elements (navigation buttons, running headers).
+    # Text appearing on more than 20 % of pages or more than 4 times is noise.
+    from collections import Counter
+    text_freq = Counter(h[1] for h in raw)
+    max_allowed = max(4, total_pages * 0.20)
+    raw = [h for h in raw if text_freq[h[1]] <= max_allowed]
+
+    # Remove consecutive duplicate (page, text) pairs produced by multi-span lines.
+    headings: list = []
+    seen_key: tuple | None = None
+    for h in raw:
+        key = (h[2], h[1])
+        if key != seen_key:
+            headings.append(h)
+            seen_key = key
+
+    return headings
 
 
 def _rebuild_acroform(merged: "pikepdf.Pdf") -> None:
@@ -647,6 +754,7 @@ def main() -> None:
             args.out,
             original_paths=original_paths,
             gen_toc=args.gen_toc,
+            extract_headings=args.ocr,
         )
     finally:
         if tmpdir:

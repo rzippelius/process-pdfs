@@ -263,6 +263,7 @@ def _rebuild_acroform(merged: "pikepdf.Pdf") -> None:
 
     root_fields: list = []
     seen: set = set()
+    seen_names: dict = {}  # /T value → count of times seen
 
     for page in merged.pages:
         for annot in page.get("/Annots", pikepdf.Array()):
@@ -278,6 +279,16 @@ def _rebuild_acroform(merged: "pikepdf.Pdf") -> None:
                     objgen = obj.objgen
                     if objgen not in seen:
                         seen.add(objgen)
+                        # Rename duplicate /T field names so the viewer treats each
+                        # merged file's buttons as independent fields.  If both
+                        # source PDFs have a root field named '1', the second becomes
+                        # '1_2', the third '1_3', etc.
+                        t = str(obj.get("/T", ""))
+                        if t in seen_names:
+                            seen_names[t] += 1
+                            obj["/T"] = pikepdf.String(t + "_" + str(seen_names[t]))
+                        else:
+                            seen_names[t] = 1
                         root_fields.append(obj)
                 except AttributeError:
                     pass

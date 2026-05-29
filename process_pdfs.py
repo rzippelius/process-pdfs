@@ -240,8 +240,7 @@ def combine_pdfs(
     # garbage=0 avoids re-compacting the xref, preserving the pikepdf structure.
     doc = fitz.open(output_path)
     if gen_toc:
-        _add_toc_page(doc, file_meta)
-        toc_page_idx = len(doc) - 1
+        toc_page_idx = _add_toc_page(doc, file_meta)
         _set_bookmarks(doc, file_meta, toc_page_idx)
     else:
         _set_bookmarks(doc, file_meta)
@@ -347,7 +346,6 @@ def _extract_headings_from_text(pdf_path: str) -> list:
 
     # Filter out repeating elements (navigation buttons, running headers).
     # Text appearing on more than 20 % of pages or more than 4 times is noise.
-    from collections import Counter
     text_freq = Counter(h[1] for h in raw)
     max_allowed = max(4, total_pages * 0.20)
     raw = [h for h in raw if text_freq[h[1]] <= max_allowed]
@@ -556,159 +554,183 @@ def _set_bookmarks(doc, file_meta: list, toc_page_idx: int | None = None) -> Non
 
 
 # ---------------------------------------------------------------------------
-# Visible TOC page
+# Visible TOC page — ReportLab layout + PyMuPDF link annotations
 # ---------------------------------------------------------------------------
 
-_TOC_FONT = "helv"
-_TOC_MARGIN = 50
-_TOC_LINE_H = 18
-_COL_DOT = 0.55  # Fraction of page width where dot leaders start
-_COLOR_HEADING = (0.10, 0.10, 0.50)
-_COLOR_LINK = (0.00, 0.00, 0.75)
-_COLOR_PAGENUM = (0.25, 0.25, 0.25)
-_COLOR_BLACK = (0.0, 0.0, 0.0)
+_TOC_PAGE_W   = 595.28   # A4 width  in points
+_TOC_PAGE_H   = 841.89   # A4 height in points
+_TOC_MARGIN   = 50.0
+_TOC_LINE_H   = 18.0
+_TOC_HEADER_H = 65.0
+_TOC_SEC_GAP  = 12.0
+_TOC_MIN_Y    = 45.0     # min ReportLab y before forcing a new page
 
 
-def _add_toc_page(doc, file_meta: list) -> None:
-    """Append one or more styled, clickable Table of Contents pages to doc."""
-    import fitz
+def _render_toc_reportlab(file_meta: list, doc_page_count: int) -> tuple:
+    """Render TOC pages with ReportLab; return (pdf_bytes, link_rows).
 
-    def _new_toc_page() -> tuple:
-        """Add a blank page and draw the header; return (page, current_y)."""
-        pg = doc.new_page()
-        pw = pg.rect.width
-        # Title bar
-        pg.draw_rect(
-            fitz.Rect(0, 0, pw, _TOC_MARGIN + 35),
-            color=None,
-            fill=(0.15, 0.25, 0.50),
-        )
-        pg.insert_text(
-            fitz.Point(_TOC_MARGIN, _TOC_MARGIN + 22),
-            "Table of Contents",
-            fontsize=20,
-            fontname=_TOC_FONT,
-            color=(1.0, 1.0, 1.0),
-        )
-        return pg, _TOC_MARGIN + 55
+    link_rows — list of dicts:
+        toc_page   : 0-based page index in the returned PDF
+        rl_y_top   : top    of the clickable row, ReportLab coords (y from bottom)
+        rl_y_bot   : bottom of the clickable row, ReportLab coords
+        x0, x1     : horizontal extent of the clickable area (points)
+        target_page: 0-based page index in the combined document
+    """
+    from reportlab.pdfgen import canvas as rl_canvas
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    import io
 
-    def _ensure_space(pg, y: float) -> tuple:
-        """Start a new page if too little space remains."""
-        if y > pg.rect.height - _TOC_MARGIN:
-            pg, y = _new_toc_page()
-        return pg, y
+    PW, PH  = _TOC_PAGE_W, _TOC_PAGE_H
+    M       = _TOC_MARGIN
+    LINE_H  = _TOC_LINE_H
+    HDR_H   = _TOC_HEADER_H
+    SEC_GAP = _TOC_SEC_GAP
+    MIN_Y   = _TOC_MIN_Y
 
-    page, y = _new_toc_page()
-    pw = page.rect.width
-    dot_x = pw * _COL_DOT
+    C_HDR_BG  = (0.15, 0.25, 0.50)
+    C_HDR_TXT = (1.00, 1.00, 1.00)
+    C_FILE    = (0.10, 0.10, 0.50)
+    C_ENTRY   = (0.00, 0.00, 0.60)
+    C_PAGENUM = (0.40, 0.40, 0.40)
+    C_DOT     = (0.70, 0.70, 0.70)
 
-    for orig_path, page_offset, page_count, toc in file_meta:
-        page, y = _ensure_space(page, y)
-        pw = page.rect.width
-        dot_x = pw * _COL_DOT
+    buf = io.BytesIO()
+    c = rl_canvas.Canvas(buf, pagesize=(PW, PH))
+    link_rows: list = []
+    toc_page = 0
+
+    def draw_header() -> None:
+        c.setFillColorRGB(*C_HDR_BG)
+        c.rect(0, PH - HDR_H, PW, HDR_H, fill=1, stroke=0)
+        c.setFillColorRGB(*C_HDR_TXT)
+        c.setFont("Helvetica-Bold", 20)
+        c.drawString(M, PH - HDR_H + 18, "Table of Contents")
+
+    def new_page() -> float:
+        nonlocal toc_page
+        c.showPage()
+        toc_page += 1
+        draw_header()
+        return PH - HDR_H - 22.0
+
+    def ensure(rl_y: float, need: float) -> float:
+        return new_page() if rl_y - need < MIN_Y else rl_y
+
+    def record_link(rl_y: float, fs: float, x0: float, x1: float,
+                    target: int) -> None:
+        link_rows.append({
+            "toc_page":    toc_page,
+            "rl_y_top":    rl_y + fs * 0.85,
+            "rl_y_bot":    rl_y - fs * 0.30,
+            "x0":          x0,
+            "x1":          x1,
+            "target_page": target,
+        })
+
+    def draw_entry(rl_y: float, indent: float, title: str,
+                   font_name: str, fs: float,
+                   target: int, display_page: int) -> None:
+        pn_text = f"p. {display_page}"
+        pn_w    = stringWidth(pn_text, "Helvetica", fs)
+        pn_x    = PW - M - pn_w
+
+        # Truncate title so it never overlaps the page-number column
+        max_w = pn_x - indent - 14.0
+        while len(title) > 4 and stringWidth(title, font_name, fs) > max_w:
+            title = title[:-1]
+
+        title_end_x = indent + stringWidth(title, font_name, fs) + 4.0
+
+        # Dot leaders
+        dot_w = stringWidth(".", "Helvetica", fs - 1)
+        x = title_end_x + 3.0
+        c.setFillColorRGB(*C_DOT)
+        c.setFont("Helvetica", fs - 1)
+        while x + dot_w + 2 < pn_x - 4:
+            c.drawString(x, rl_y - 1, ".")
+            x += dot_w + 3.0
+
+        c.setFont(font_name, fs)
+        c.setFillColorRGB(*C_ENTRY)
+        c.drawString(indent, rl_y, title)
+
+        c.setFont("Helvetica", fs)
+        c.setFillColorRGB(*C_PAGENUM)
+        c.drawRightString(PW - M, rl_y, pn_text)
+
+        record_link(rl_y, fs, indent, PW - M, target)
+
+    # ---- first page ----
+    draw_header()
+    rl_y: float = PH - HDR_H - 22.0
+
+    for orig_path, page_offset, _count, toc in file_meta:
+        rl_y = ensure(rl_y, LINE_H + 4)
 
         file_title = Path(orig_path).stem
+        c.setFont("Helvetica-Bold", 13)
+        c.setFillColorRGB(*C_FILE)
+        c.drawString(M, rl_y, file_title)
+        record_link(rl_y, 13.0, M, PW - M, page_offset)
+        rl_y -= LINE_H + 4
 
-        # ---- File-level heading ----
-        page.insert_text(
-            fitz.Point(_TOC_MARGIN, y),
-            file_title,
-            fontsize=13,
-            fontname=_TOC_FONT,
-            color=_COLOR_HEADING,
-        )
-        # Clickable rect for the file heading
-        heading_rect = fitz.Rect(_TOC_MARGIN, y - 12, pw - _TOC_MARGIN, y + 4)
-        page.insert_link({
-            "kind": fitz.LINK_GOTO,
-            "from": heading_rect,
-            "page": page_offset,
-            "to": fitz.Point(0, 0),
-        })
-        y += _TOC_LINE_H + 4
-
-        # ---- Chapter entries from the file's own bookmark tree ----
         entries = toc if toc else []
         if not entries:
-            # File has no bookmarks — show a generic "Start of document" entry
-            page, y = _ensure_space(page, y)
-            _draw_toc_entry(
-                page, y,
-                indent=_TOC_MARGIN + 16,
-                title="(start of document)",
-                page_num_display=page_offset + 1,
-                target_page=page_offset,
-                dot_x=dot_x,
-                pw=pw,
-                fontsize=10,
-                color=_COLOR_PAGENUM,
-            )
-            y += _TOC_LINE_H
+            rl_y = ensure(rl_y, LINE_H)
+            c.setFont("Helvetica-Oblique", 10)
+            c.setFillColorRGB(*C_PAGENUM)
+            c.drawString(M + 16, rl_y, "(start of document)")
+            rl_y -= LINE_H
         else:
             for entry in entries:
                 level, entry_title, entry_page_num, *_ = entry
-                # entry_page_num is 1-based within the source file
-                abs_page_0 = max(0, min(entry_page_num - 1 + page_offset, len(doc) - 1))
-                display_page = abs_page_0 + 1
-
-                page, y = _ensure_space(page, y)
-                pw = page.rect.width
-                dot_x = pw * _COL_DOT
-
-                indent = _TOC_MARGIN + (level - 1) * 16
-                _draw_toc_entry(
-                    page, y,
-                    indent=indent,
-                    title=entry_title,
-                    page_num_display=display_page,
-                    target_page=abs_page_0,
-                    dot_x=dot_x,
-                    pw=pw,
-                    fontsize=10 if level > 1 else 11,
-                    color=_COLOR_LINK,
+                abs_page_0 = min(
+                    page_offset + max(0, entry_page_num - 1),
+                    doc_page_count - 1,
                 )
-                y += _TOC_LINE_H
+                rl_y = ensure(rl_y, LINE_H)
+                indent = M + (level - 1) * 16.0
+                fn = "Helvetica-Bold" if level == 1 else "Helvetica"
+                fs = 11.0 if level == 1 else 10.0
+                draw_entry(rl_y, indent, entry_title, fn, fs,
+                           abs_page_0, abs_page_0 + 1)
+                rl_y -= LINE_H
 
-        y += 12  # Gap between file sections
+        rl_y -= SEC_GAP
+
+    c.save()
+    return buf.getvalue(), link_rows
 
 
-def _draw_toc_entry(
-    page,
-    y: float,
-    *,
-    indent: float,
-    title: str,
-    page_num_display: int,
-    target_page: int,
-    dot_x: float,
-    pw: float,
-    fontsize: float,
-    color: tuple,
-) -> None:
-    """Draw one TOC line: title ... page_num, with a clickable link over the whole line."""
+def _add_toc_page(doc, file_meta: list) -> int:
+    """Append TOC page(s) and return the 0-based index of the first TOC page.
+
+    ReportLab renders the visual layout and returns exact row bounds.
+    PyMuPDF inserts those pages then stamps link annotations at the bounds.
+    """
     import fitz
 
-    margin = _TOC_MARGIN
-    # Estimate max chars before dot column (6 pts per char is a rough approximation)
-    max_chars = max(10, int((dot_x - indent) / (fontsize * 0.55)))
-    if len(title) > max_chars:
-        title = title[: max_chars - 1] + "…"  # ellipsis
+    toc_bytes, link_rows = _render_toc_reportlab(file_meta, len(doc))
 
-    page.insert_text(fitz.Point(indent, y), title, fontsize=fontsize, fontname=_TOC_FONT, color=color)
+    toc_doc   = fitz.open("pdf", toc_bytes)
+    insert_at = len(doc)
+    doc.insert_pdf(toc_doc)
+    toc_doc.close()
 
-    page_label = f"p. {page_num_display}"  # narrow non-breaking space
-    page.insert_text(
-        fitz.Point(dot_x, y), page_label, fontsize=fontsize, fontname=_TOC_FONT, color=_COLOR_PAGENUM
-    )
+    for row in link_rows:
+        pg = doc[insert_at + row["toc_page"]]
+        ph = pg.rect.height          # actual height from the inserted PDF
+        # ReportLab y is from the bottom; fitz y is from the top.
+        fitz_y_top = ph - row["rl_y_top"]
+        fitz_y_bot = ph - row["rl_y_bot"]
+        pg.insert_link({
+            "kind": fitz.LINK_GOTO,
+            "from": fitz.Rect(row["x0"], fitz_y_top, row["x1"], fitz_y_bot),
+            "page": row["target_page"],
+            "to":   fitz.Point(0, 0),
+        })
 
-    # Clickable annotation covering the entire row
-    link_rect = fitz.Rect(indent, y - fontsize, pw - margin, y + 3)
-    page.insert_link({
-        "kind": fitz.LINK_GOTO,
-        "from": link_rect,
-        "page": target_page,
-        "to": fitz.Point(0, 0),
-    })
+    return insert_at
 
 
 # ---------------------------------------------------------------------------

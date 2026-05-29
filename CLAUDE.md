@@ -22,21 +22,34 @@ main()
  ├── expand_file_patterns()       split on comma, glob each pattern, deduplicate
  ├── ocr_file(src, dst)           ocrmypdf.ocr(..., skip_text=True)
  └── combine_pdfs(pdfs, out, ...)
-      ├── fitz.open() + insert_pdf() per file   build combined doc, collect file_meta
-      ├── _fix_cross_file_links()               GoToR → GoTo via PyMuPDF get_links()
+      ├── pikepdf.Pdf.new() + pages.extend()   merge pages — preserves ALL annotations
+      ├── _fix_external_links()                 /GoToR + /Launch → /GoTo (pikepdf pass)
+      ├── fitz.open()                           re-open for TOC/bookmark decoration
       ├── _add_toc_page()                       append visible TOC page with link annotations
       ├── _set_bookmarks()                      doc.set_toc() with merged outline
-      ├── fitz.save()                           write combined PDF to disk
-      └── _fix_launch_links()                   /Launch → /GoTo via pikepdf (second pass)
+      └── fitz.save(garbage=0)                  save without xref re-compaction
 ```
 
-### Why Two Link-Fixing Passes
+### Why pikepdf for the Merge
 
-PyMuPDF's `get_links()` exposes `/GoToR` links but **silently drops `/Launch` annotations**.
-Many PDFs use `/Launch` to open companion PDFs (e.g. a component manual referenced from a
-main document). After combining, these should navigate inside the combined PDF.
-The pikepdf second pass reads the raw annotation objects from the saved file and rewrites
-any `/Launch` whose `/F` target matches one of the input files.
+PyMuPDF's `insert_pdf()` silently drops annotations that contain indirect references to
+objects with broken xref entries — a common defect in PDFs from older authoring tools.
+For `86etm.pdf`, this caused 34 of 62 annotations to be lost (PyMuPDF kept 28; pikepdf
+keeps all 62). pikepdf's `pages.extend()` is more lenient: it copies page annotations
+as-is without trying to resolve every referenced object.
+
+### Why pikepdf for Link Fixing
+
+PyMuPDF's `get_links()` surfaces `/GoToR` but **silently drops `/Launch` annotations**.
+`_fix_external_links()` handles both in a single pikepdf pass over the raw annotation
+dictionaries, replacing either action type with `/GoTo` + page-object reference when the
+target file is one of the inputs.
+
+### Why `garbage=0` on the Final fitz Save
+
+`garbage=4` re-compacts the xref and can drop objects that have dangling references. With
+`garbage=0` PyMuPDF only appends new objects (TOC page, bookmark tree) without touching
+existing ones.
 
 ## Libraries
 

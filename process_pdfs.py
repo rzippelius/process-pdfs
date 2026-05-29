@@ -193,44 +193,60 @@ def combine_pdfs(
             Defaults to pdf_paths when not provided.
         gen_toc: When True, append a visible clickable TOC page at the end.
     """
-    import fitz  # PyMuPDF
+    import fitz
+    import pikepdf
 
     if original_paths is None:
         original_paths = pdf_paths
 
-    combined = fitz.open()
-    # file_meta: list of (original_path, page_offset, page_count, toc)
     file_meta: list[tuple[str, int, int, list]] = []
 
-    for pdf_path, orig_path in zip(pdf_paths, original_paths):
-        page_offset = len(combined)
-        src = fitz.open(pdf_path)
-        toc = src.get_toc()
-        page_count = len(src)
-        combined.insert_pdf(src)
-        src.close()
-        file_meta.append((orig_path, page_offset, page_count, toc))
+    # ---- Step 1: merge with pikepdf ----
+    # pikepdf.pages.extend() preserves ALL page annotations, including those
+    # that PyMuPDF's insert_pdf() silently drops when source PDFs have broken
+    # xref entries (a common defect in PDFs from older authoring tools).
+    with pikepdf.Pdf.new() as merged:
+        for pdf_path, orig_path in zip(pdf_paths, original_paths):
+            page_offset = len(merged.pages)
+            with pikepdf.open(pdf_path) as src:
+                page_count = len(src.pages)
+                merged.pages.extend(src.pages)
+            toc = _get_toc(pdf_path)
+            file_meta.append((orig_path, page_offset, page_count, toc))
+        merged.save(output_path)
 
-    _fix_cross_file_links(combined, file_meta)
+    # ---- Step 2: fix all external links (GoToR + Launch) via pikepdf ----
+    _fix_external_links(output_path, file_meta)
 
+    # ---- Step 3: add TOC page and bookmarks via PyMuPDF ----
+    # garbage=0 avoids re-compacting the xref, preserving the pikepdf structure.
+    doc = fitz.open(output_path)
     if gen_toc:
-        _add_toc_page(combined, file_meta)
-        # Add a bookmark pointing to the TOC page itself
-        toc_page_idx = len(combined) - 1  # last page
-        _set_bookmarks(combined, file_meta, toc_page_idx)
+        _add_toc_page(doc, file_meta)
+        toc_page_idx = len(doc) - 1
+        _set_bookmarks(doc, file_meta, toc_page_idx)
     else:
-        _set_bookmarks(combined, file_meta)
+        _set_bookmarks(doc, file_meta)
+    tmp = output_path + ".fitz_tmp"
+    doc.save(tmp, garbage=0, deflate=True, clean=False)
+    doc.close()
+    os.replace(tmp, output_path)
 
-    combined.save(output_path, garbage=4, deflate=True)
-    combined.close()
 
-    # Second pass: fix /Launch annotations that PyMuPDF's get_links() does not expose.
-    # These are common when PDFs use /Launch to open companion PDF files.
-    _fix_launch_links(output_path, file_meta)
+def _get_toc(pdf_path: str) -> list:
+    """Extract the bookmark/outline tree from a PDF using fitz."""
+    import fitz
+    try:
+        doc = fitz.open(pdf_path)
+        toc = doc.get_toc()
+        doc.close()
+        return toc
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------
-# Cross-file link fixing — shared helpers
+# Cross-file link fixing
 # ---------------------------------------------------------------------------
 
 def _build_offset_lookup(file_meta: list) -> dict[str, int]:
@@ -260,50 +276,11 @@ def _resolve_offset(
     return None
 
 
-def _fix_cross_file_links(doc, file_meta: list) -> None:
-    """Convert GoToR (external-file) links into internal GoTo links via PyMuPDF.
+def _fix_external_links(output_path: str, file_meta: list) -> None:
+    """Rewrite /GoToR and /Launch links that target input PDFs as internal /GoTo.
 
-    PyMuPDF's get_links() exposes GoToR links but not /Launch annotations;
-    the latter are handled by _fix_launch_links() after saving.
-    """
-    import fitz
-
-    offset_by_path = _build_offset_lookup(file_meta)
-    total_pages = len(doc)
-
-    for page_num in range(total_pages):
-        page = doc[page_num]
-        links_to_fix = [lk for lk in page.get_links() if lk.get("kind") == fitz.LINK_GOTOR]
-
-        for link in links_to_fix:
-            target_file = link.get("file", "")
-            if not target_file:
-                continue
-            offset = _resolve_offset(target_file, offset_by_path)
-            if offset is None:
-                continue
-
-            # link["page"] is 0-indexed within the referenced file
-            target_page = max(0, min(link.get("page", 0) + offset, total_pages - 1))
-
-            page.delete_link(link)
-            page.insert_link({
-                "kind": fitz.LINK_GOTO,
-                "from": link["from"],
-                "page": target_page,
-                "to": fitz.Point(0, 0),
-            })
-
-
-def _fix_launch_links(output_path: str, file_meta: list) -> None:
-    """Post-process the saved PDF with pikepdf to convert /Launch → /GoTo.
-
-    PDF viewers open /Launch annotations by launching an external application;
-    when the target is another input PDF, the correct behaviour after combining
-    is to navigate to the first page of that file within the combined document.
-
-    PyMuPDF's get_links() does not surface /Launch annotations, so this step
-    uses pikepdf for direct PDF-object access.
+    Both link types are handled in a single pikepdf pass since PyMuPDF's
+    get_links() only surfaces /GoToR and silently drops /Launch annotations.
     """
     import pikepdf
 
@@ -314,37 +291,46 @@ def _fix_launch_links(output_path: str, file_meta: list) -> None:
         total_pages = len(pdf.pages)
 
         for page in pdf.pages:
-            raw_annots = page.get("/Annots", pikepdf.Array())
-            if not raw_annots:
+            annots = page.get("/Annots", pikepdf.Array())
+            if not annots:
                 continue
 
-            for annot in raw_annots:
+            for annot in annots:
                 try:
                     if str(annot.get("/Subtype", "")) != "/Link":
                         continue
                     action = annot.get("/A")
                     if action is None:
                         continue
-                    if str(action.get("/S", "")) != "/Launch":
+                    s = str(action.get("/S", ""))
+                    if s not in ("/GoToR", "/Launch"):
                         continue
 
-                    # /F is either a string or a FileSpec dictionary
+                    # Extract filename from /F (string or FileSpec dictionary)
                     f_obj = action.get("/F")
                     if f_obj is None:
                         continue
                     target = (
-                        str(f_obj.get("/F", f_obj))
-                        if hasattr(f_obj, "get")
-                        else str(f_obj)
+                        str(f_obj.get("/F", f_obj)) if hasattr(f_obj, "get") else str(f_obj)
                     )
                     if not target:
                         continue
 
                     offset = _resolve_offset(target, offset_by)
                     if offset is None:
-                        continue  # target is not one of our input files
+                        continue  # not one of our input files; leave unchanged
 
-                    abs_page_idx = max(0, min(offset, total_pages - 1))
+                    # /GoToR carries an optional page-within-file in /D
+                    page_in_file = 0
+                    if s == "/GoToR":
+                        d = action.get("/D")
+                        if isinstance(d, pikepdf.Array) and len(d) > 0:
+                            try:
+                                page_in_file = max(0, int(d[0]))
+                            except (TypeError, ValueError):
+                                page_in_file = 0
+
+                    abs_page_idx = max(0, min(offset + page_in_file, total_pages - 1))
                     annot["/A"] = pikepdf.Dictionary(
                         S=pikepdf.Name("/GoTo"),
                         D=pikepdf.Array([

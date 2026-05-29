@@ -151,27 +151,33 @@ def ocr_file(src_path: str, dst_path: str) -> None:
     Pages that already contain text are skipped (--skip-text) to avoid
     degrading quality of already-searchable PDFs.
     """
-    _ensure_tesseract_on_path()
-    _ensure_ghostscript_on_path()
-
     try:
         import ocrmypdf
     except ImportError:
         print("Error: ocrmypdf is not installed. Run: pip install ocrmypdf", file=sys.stderr)
         sys.exit(1)
 
+    import io, contextlib
+    stderr_buf = io.StringIO()
     try:
-        ocrmypdf.ocr(
-            src_path,
-            dst_path,
-            skip_text=True,
-            progress_bar=False,
-        )
+        with contextlib.redirect_stderr(stderr_buf):
+            ocrmypdf.ocr(
+                src_path,
+                dst_path,
+                skip_text=True,
+                progress_bar=False,
+            )
     except ocrmypdf.exceptions.PriorOcrFoundError:
         shutil.copy2(src_path, dst_path)
     except Exception as exc:
         print(f"Warning: OCR failed for '{src_path}': {exc}", file=sys.stderr)
         shutil.copy2(src_path, dst_path)
+    finally:
+        # Re-print captured stderr, filtering out [WinError 2] probe noise from
+        # ocrmypdf checking for optional tools (Ghostscript, unpaper, pngquant …)
+        for line in stderr_buf.getvalue().splitlines():
+            if "[WinError 2]" not in line:
+                print(line, file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +627,8 @@ def main() -> None:
 
     # --- OCR pass (optional) ---
     if args.ocr:
+        _ensure_tesseract_on_path()
+        _ensure_ghostscript_on_path()
         print("\nRunning OCR ...")
         tmpdir = tempfile.mkdtemp(prefix="process_pdfs_ocr_")
         ocr_paths: list[str] = []

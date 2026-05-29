@@ -213,6 +213,12 @@ def combine_pdfs(
                 merged.pages.extend(src.pages)
             toc = _get_toc(pdf_path)
             file_meta.append((orig_path, page_offset, page_count, toc))
+
+        # pikepdf.pages.extend() copies Widget annotation /Parent form-field
+        # objects transitively but does NOT register them in /AcroForm/Fields.
+        # Without that registration, PDF viewers treat the buttons as inert.
+        _rebuild_acroform(merged)
+
         merged.save(output_path)
 
     # ---- Step 2: fix all external links (GoToR + Launch) via pikepdf ----
@@ -243,6 +249,57 @@ def _get_toc(pdf_path: str) -> list:
         return toc
     except Exception:
         return []
+
+
+def _rebuild_acroform(merged: "pikepdf.Pdf") -> None:
+    """Register Widget annotations' root form fields in /AcroForm/Fields.
+
+    pikepdf.pages.extend() copies Widget /Parent form-field objects transitively
+    but does NOT add them to /AcroForm/Fields, so PDF viewers treat the buttons as
+    inert. This function walks every Widget annotation, follows the /Parent chain to
+    the root field, and adds it to the document's /AcroForm/Fields array.
+    """
+    import pikepdf
+
+    root_fields: list = []
+    seen: set = set()
+
+    for page in merged.pages:
+        for annot in page.get("/Annots", pikepdf.Array()):
+            try:
+                if str(annot.get("/Subtype", "")) != "/Widget":
+                    continue
+                obj = annot
+                parent = obj.get("/Parent")
+                while parent is not None:
+                    obj = parent
+                    parent = obj.get("/Parent")
+                try:
+                    objgen = obj.objgen
+                    if objgen not in seen:
+                        seen.add(objgen)
+                        root_fields.append(obj)
+                except AttributeError:
+                    pass
+            except Exception:
+                continue
+
+    if not root_fields:
+        return
+
+    if "/AcroForm" not in merged.Root:
+        merged.Root["/AcroForm"] = pikepdf.Dictionary(
+            Fields=pikepdf.Array(root_fields),
+            DA=pikepdf.String("/Helv 0 Tf 0 g"),
+        )
+    else:
+        existing = list(merged.Root["/AcroForm"].get("/Fields", pikepdf.Array()))
+        existing_objgens = {o.objgen for o in existing if hasattr(o, "objgen")}
+        new_fields = [
+            f for f in root_fields
+            if not hasattr(f, "objgen") or f.objgen not in existing_objgens
+        ]
+        merged.Root["/AcroForm"]["/Fields"] = pikepdf.Array(existing + new_fields)
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +354,7 @@ def _fix_external_links(output_path: str, file_meta: list) -> None:
 
             for annot in annots:
                 try:
-                    if str(annot.get("/Subtype", "")) != "/Link":
+                    if str(annot.get("/Subtype", "")) not in ("/Link", "/Widget"):
                         continue
                     action = annot.get("/A")
                     if action is None:

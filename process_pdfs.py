@@ -550,7 +550,18 @@ def _set_bookmarks(doc, file_meta: list, toc_page_idx: int | None = None) -> Non
     if toc_page_idx is not None:
         combined_toc.append([1, "Table of Contents", toc_page_idx + 1])
 
-    doc.set_toc(combined_toc)
+    # PyMuPDF rejects any entry whose level exceeds the previous entry's level
+    # by more than 1 (e.g. level-1 file heading followed directly by a level-3
+    # extracted heading).  Clamp each level to at most prev+1.
+    normalized: list[list] = []
+    prev_level = 0
+    for entry in combined_toc:
+        lvl, *rest = entry
+        lvl = max(1, min(lvl, prev_level + 1))
+        normalized.append([lvl] + rest)
+        prev_level = lvl
+
+    doc.set_toc(normalized)
 
 
 # ---------------------------------------------------------------------------
